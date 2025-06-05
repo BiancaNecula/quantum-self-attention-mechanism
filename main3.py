@@ -49,15 +49,15 @@ EMBED_DIM = 2           # Embedding dimension - MUST BE A POWER OF 2 for Amplitu
 MAX_LEN = 20            # Maximum sequence length - Adjust based on chosen dataset
                         # AA Softmax is currently fixed to this MAX_LEN.
 # Training Hyperparameters
-BATCH_SIZE = 4
-LEARNING_RATE = 0.0005  # Reduced learning rate
+BATCH_SIZE = 2          # Keep small batch size
+LEARNING_RATE = 0.00005  # Further reduced learning rate
 NUM_EPOCHS = 5
-GRAD_CLIP_VALUE = 1.0   # For gradient clipping
+GRAD_CLIP_VALUE = 0.1   # Further reduced gradient clipping
 
 # Quantum Circuit Hyperparameters
-N_SHOTS_QIP = 100
-N_SHOTS_AA = 100
-AA_ITERATIONS = 1
+N_SHOTS_QIP = 1000     # Increased shots for better stability
+N_SHOTS_AA = 1000      # Increased shots for better stability
+AA_ITERATIONS = 1      # Keep single iteration for stability
 
 # Dataset specific
 PAD_TOKEN = "<pad>"
@@ -167,56 +167,148 @@ def collate_batch_custom(batch):
 def hadamard_test_re_inner_product_circuit(q_features, k_features):
     ancilla_wire = 0
     encoding_wires = list(range(N_QUBITS_ANCILLA_QIP, N_QUBITS_ANCILLA_QIP + N_QUBITS_AE_ENCODING))
-    qml.Hadamard(wires=ancilla_wire)
-    qml.PauliX(wires=ancilla_wire)
-    qml.ctrl(lambda features: qml.AmplitudeEmbedding(features=features, wires=encoding_wires, normalize=True, pad_with=0.), 
-             control=ancilla_wire)(features=q_features)
-    qml.PauliX(wires=ancilla_wire)
-    qml.ctrl(lambda features: qml.AmplitudeEmbedding(features=features, wires=encoding_wires, normalize=True, pad_with=0.), 
-             control=ancilla_wire)(features=k_features)
-    qml.Hadamard(wires=ancilla_wire)
-    return qml.probs(wires=ancilla_wire)
+    
+    # Normalize input features to prevent extreme values
+    q_norm = torch.linalg.norm(q_features)
+    k_norm = torch.linalg.norm(k_features)
+    if q_norm < 1e-9 or k_norm < 1e-9:
+        return torch.tensor([0.5, 0.5], device=q_features.device)
+    
+    # Scale down features but maintain normalization
+    q_features = (q_features / (q_norm + 1e-9)) * 0.1
+    k_features = (k_features / (k_norm + 1e-9)) * 0.1
+    
+    # Renormalize after scaling
+    q_norm = torch.linalg.norm(q_features)
+    k_norm = torch.linalg.norm(k_features)
+    q_features = q_features / (q_norm + 1e-9)
+    k_features = k_features / (k_norm + 1e-9)
+    
+    try:
+        qml.Hadamard(wires=ancilla_wire)
+        qml.PauliX(wires=ancilla_wire)
+        
+        # Add error handling for amplitude encoding
+        try:
+            qml.ctrl(lambda features: qml.AmplitudeEmbedding(
+                features=features, 
+                wires=encoding_wires, 
+                normalize=True,  # Ensure normalization
+                pad_with=0.
+            ), control=ancilla_wire)(features=q_features)
+        except Exception as e:
+            logger.error(f"Error in Q amplitude encoding: {e}")
+            return torch.tensor([0.5, 0.5], device=q_features.device)
+            
+        qml.PauliX(wires=ancilla_wire)
+        
+        try:
+            qml.ctrl(lambda features: qml.AmplitudeEmbedding(
+                features=features, 
+                wires=encoding_wires, 
+                normalize=True,  # Ensure normalization
+                pad_with=0.
+            ), control=ancilla_wire)(features=k_features)
+        except Exception as e:
+            logger.error(f"Error in K amplitude encoding: {e}")
+            return torch.tensor([0.5, 0.5], device=k_features.device)
+            
+        qml.Hadamard(wires=ancilla_wire)
+        return qml.probs(wires=ancilla_wire)
+    except Exception as e:
+        logger.error(f"Error in quantum circuit: {e}")
+        return torch.tensor([0.5, 0.5], device=q_features.device)
 
 @qml.qnode(dev_aa_softmax, interface="torch", diff_method="parameter-shift")
 def partial_amplitude_amplification_softmax(initial_probabilities):
     num_input_states = len(initial_probabilities)
     if num_input_states != MAX_LEN:
         raise ValueError(f"partial_amplitude_amplification_softmax expects {MAX_LEN} initial probabilities, got {num_input_states}.")
+    
     target_wires = list(range(N_QUBITS_AA_SOFTMAX))
     expected_dim_for_stateprep = 2**N_QUBITS_AA_SOFTMAX
     
+    # Ensure probabilities are valid
     initial_probs_numpy = initial_probabilities.detach().cpu().numpy()
-    initial_probs_clipped = pnp.clip(initial_probs_numpy, 0, 1) 
+    initial_probs_clipped = pnp.clip(initial_probs_numpy, 0, 1)
     
-    sqrt_probs_cpu = pnp.sqrt(initial_probs_clipped) 
+    # Check if all probabilities are too small
+    if pnp.max(initial_probs_clipped) < 1e-9:
+        uniform_state = pnp.ones(expected_dim_for_stateprep) / pnp.sqrt(expected_dim_for_stateprep)
+        qml.StatePrep(uniform_state, wires=target_wires)
+        return qml.probs(wires=target_wires)
     
-    if num_input_states < expected_dim_for_stateprep:
-        padding_len = expected_dim_for_stateprep - num_input_states
-        sqrt_probs_padded = pnp.pad(sqrt_probs_cpu, (0, padding_len), mode='constant', constant_values=0.0)
-    else:
-        sqrt_probs_padded = sqrt_probs_cpu
+    # Normalize probabilities
+    prob_sum = pnp.sum(initial_probs_clipped)
+    if prob_sum < 1e-9:
+        uniform_state = pnp.ones(expected_dim_for_stateprep) / pnp.sqrt(expected_dim_for_stateprep)
+        qml.StatePrep(uniform_state, wires=target_wires)
+        return qml.probs(wires=target_wires)
+    
+    initial_probs_clipped = initial_probs_clipped / (prob_sum + 1e-9)
+    
+    try:
+        # Calculate square root of probabilities
+        sqrt_probs_cpu = pnp.sqrt(initial_probs_clipped)
         
-    norm_sqrt_probs = pnp.linalg.norm(sqrt_probs_padded)
-    if norm_sqrt_probs < 1e-9:
-        # logger.warning("sqrt_probs_padded has zero norm in AA softmax. Using uniform state.")
-        sqrt_probs_padded = pnp.ones(expected_dim_for_stateprep) / pnp.sqrt(expected_dim_for_stateprep)
-
-    qml.StatePrep(sqrt_probs_padded, wires=target_wires)
-    
-    mean_prob_val = pnp.mean(initial_probs_clipped) 
-    diag_phases = pnp.ones(expected_dim_for_stateprep) 
-    for j_idx in range(num_input_states):
-        if initial_probs_clipped[j_idx] > mean_prob_val: 
-            diag_phases[j_idx] = -1.0
-    qml.DiagonalQubitUnitary(diag_phases, wires=target_wires)
-    
-    for _ in range(AA_ITERATIONS): 
-        qml.adjoint(qml.StatePrep(sqrt_probs_padded, wires=target_wires))
-        reflection_0_phases = pnp.ones(expected_dim_for_stateprep)
-        reflection_0_phases[0] = -1.0
-        qml.DiagonalQubitUnitary(reflection_0_phases, wires=target_wires)
+        # Pad if necessary
+        if num_input_states < expected_dim_for_stateprep:
+            padding_len = expected_dim_for_stateprep - num_input_states
+            sqrt_probs_padded = pnp.pad(sqrt_probs_cpu, (0, padding_len), mode='constant', constant_values=0.0)
+        else:
+            sqrt_probs_padded = sqrt_probs_cpu
+            
+        # Ensure proper normalization
+        norm_sqrt_probs = pnp.linalg.norm(sqrt_probs_padded)
+        if norm_sqrt_probs < 1e-9:
+            sqrt_probs_padded = pnp.ones(expected_dim_for_stateprep) / pnp.sqrt(expected_dim_for_stateprep)
+        else:
+            sqrt_probs_padded = sqrt_probs_padded / norm_sqrt_probs
+        
+        # Scale down but maintain normalization
+        sqrt_probs_padded = sqrt_probs_padded * 0.1
+        sqrt_probs_padded = sqrt_probs_padded / pnp.linalg.norm(sqrt_probs_padded)
+        
+        # Prepare initial state
         qml.StatePrep(sqrt_probs_padded, wires=target_wires)
-    return qml.probs(wires=target_wires)
+        
+        # Calculate mean probability
+        mean_prob_val = pnp.mean(initial_probs_clipped)
+        if mean_prob_val < 1e-9:
+            mean_prob_val = 1.0 / num_input_states
+            
+        # Prepare diagonal phases
+        diag_phases = pnp.ones(expected_dim_for_stateprep)
+        for j_idx in range(num_input_states):
+            if initial_probs_clipped[j_idx] > mean_prob_val:
+                diag_phases[j_idx] = -1.0
+        
+        # Apply diagonal unitary
+        qml.DiagonalQubitUnitary(diag_phases, wires=target_wires)
+        
+        # Amplitude amplification iterations
+        for _ in range(AA_ITERATIONS):
+            try:
+                # Inverse state preparation
+                qml.adjoint(qml.StatePrep)(sqrt_probs_padded, wires=target_wires)
+                
+                # Reflection about |0⟩
+                reflection_0_phases = pnp.ones(expected_dim_for_stateprep)
+                reflection_0_phases[0] = -1.0  # Full reflection
+                qml.DiagonalQubitUnitary(reflection_0_phases, wires=target_wires)
+                
+                # Forward state preparation
+                qml.StatePrep(sqrt_probs_padded, wires=target_wires)
+            except Exception as e:
+                logger.error(f"Error in AA iteration: {e}")
+                break
+                
+        return qml.probs(wires=target_wires)
+    except Exception as e:
+        logger.error(f"Error in AA softmax circuit: {e}")
+        uniform_state = pnp.ones(expected_dim_for_stateprep) / pnp.sqrt(expected_dim_for_stateprep)
+        qml.StatePrep(uniform_state, wires=target_wires)
+        return qml.probs(wires=target_wires)
 
 # --- Hybrid Model (PyTorch + Pennylane) ---
 class QuantumSelfAttentionLayer(nn.Module):
@@ -232,41 +324,56 @@ class QuantumSelfAttentionLayer(nn.Module):
         self.use_quantum_softmax = use_quantum_softmax
         self.aa_iterations = aa_iterations 
 
+        # Initialize with even smaller weights
         self.W_q = nn.Linear(embed_dim, self.d_k, bias=False)
         self.W_k = nn.Linear(embed_dim, self.d_k, bias=False)
         self.W_v = nn.Linear(embed_dim, embed_dim, bias=False)
+        
+        # Add layer normalization for Q, K, V projections
+        self.q_norm = nn.LayerNorm(self.d_k, eps=1e-6)
+        self.k_norm = nn.LayerNorm(self.d_k, eps=1e-6)
+        self.v_norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        
+        # Add dropout for regularization
+        self.dropout = nn.Dropout(0.1)
+        
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.W_q.weight, gain=1.0) 
-        nn.init.xavier_uniform_(self.W_k.weight, gain=1.0)
-        nn.init.xavier_uniform_(self.W_v.weight, gain=1.0)
+        # Use even smaller initialization for better stability
+        nn.init.xavier_uniform_(self.W_q.weight, gain=0.05)
+        nn.init.xavier_uniform_(self.W_k.weight, gain=0.05)
+        nn.init.xavier_uniform_(self.W_v.weight, gain=0.05)
 
     def _prepare_features_for_amplitude_encoding(self, params_tensor):
         current_device = params_tensor.device
         current_dtype = params_tensor.dtype
 
         if not torch.isfinite(params_tensor).all():
-            # logger.warning(f"Non-finite (NaN/inf) detected in _prepare_features. Input: {params_tensor.detach().cpu().numpy()}. Using default random vector.")
-            default_vec = torch.randn(self.embed_dim, device=current_device, dtype=current_dtype) * 0.01
+            default_vec = torch.randn(self.embed_dim, device=current_device, dtype=current_dtype) * 0.001
             if torch.linalg.norm(default_vec) < 1e-9 and self.embed_dim > 0: 
-                default_vec[0] = 0.1 # Ensure it's not an all-zero vector by making one element non-zero
-            return default_vec.clone() 
+                default_vec[0] = 0.01
+            return default_vec.clone()
 
+        # Normalize the input vector
         norm = torch.linalg.norm(params_tensor)
-        if norm < 1e-9: 
-            # logger.warning(f"Near-zero vector detected in _prepare_features (norm: {norm}). Input: {params_tensor.detach().cpu().numpy()}. Using default random vector.")
-            default_vec = torch.randn(self.embed_dim, device=current_device, dtype=current_dtype) * 0.01
-            if torch.linalg.norm(default_vec) < 1e-9 and self.embed_dim > 0: 
-                default_vec[0] = 0.1 # Ensure it's not an all-zero vector
-            return default_vec.clone() 
+        if norm < 1e-9:
+            default_vec = torch.randn(self.embed_dim, device=current_device, dtype=current_dtype) * 0.001
+            if torch.linalg.norm(default_vec) < 1e-9 and self.embed_dim > 0:
+                default_vec[0] = 0.01
+            return default_vec.clone()
         
-        return params_tensor.clone() # Return a clone to be safe
+        # Scale down the vector to prevent extreme values
+        scaled_params = params_tensor * 0.05  # Further reduced scaling
+        return scaled_params.clone()
 
     def _relu_normalize_l1(self, scores_1d):
         if not isinstance(scores_1d, torch.Tensor):
-            current_device = self.W_q.weight.device if hasattr(self.W_q, 'weight') and self.W_q.weight is not None else 'cpu'
+            current_device = self.W_q.weight.device
             scores_1d = torch.tensor(scores_1d, device=current_device, dtype=torch.float32)
+        
+        # Scale down scores before ReLU
+        scores_1d = scores_1d * 0.1
         
         relu_scores = torch.relu(scores_1d)
         l1_norm = torch.sum(relu_scores)
@@ -276,7 +383,7 @@ class QuantumSelfAttentionLayer(nn.Module):
                  return torch.tensor([], device=scores_1d.device, dtype=torch.float32)
             return torch.ones_like(relu_scores, device=scores_1d.device) / num_elements
         else:
-            return relu_scores / l1_norm 
+            return relu_scores / (l1_norm + 1e-9)  # Add epsilon for stability
 
     def forward(self, x_embed):
         batch_size, seq_len, embed_dim_runtime = x_embed.shape
@@ -289,9 +396,23 @@ class QuantumSelfAttentionLayer(nn.Module):
              raise ValueError(f"Quantum softmax is strictly configured for MAX_LEN={MAX_LEN}, "
                               f"but got input seq_len={seq_len}. Pad or truncate input sequences to MAX_LEN.")
 
-        q_classical = self.W_q(x_embed) 
-        k_classical = self.W_k(x_embed) 
-        v_classical = self.W_v(x_embed) 
+        # Scale down input embeddings for better stability
+        x_embed = x_embed * 0.05  # Further reduced scaling
+
+        # Project and normalize Q, K, V
+        q_classical = self.W_q(x_embed)
+        k_classical = self.W_k(x_embed)
+        v_classical = self.W_v(x_embed)
+        
+        # Apply layer normalization
+        q_classical = self.q_norm(q_classical)
+        k_classical = self.k_norm(k_classical)
+        v_classical = self.v_norm(v_classical)
+        
+        # Apply dropout
+        q_classical = self.dropout(q_classical)
+        k_classical = self.dropout(k_classical)
+        v_classical = self.dropout(v_classical)
 
         if not (torch.isfinite(q_classical).all() and \
                 torch.isfinite(k_classical).all() and \
@@ -301,17 +422,22 @@ class QuantumSelfAttentionLayer(nn.Module):
             nan_result_attn = torch.full((batch_size, seq_len, seq_len), float('nan'), device=x_embed.device)
             return nan_result_val, nan_result_attn
 
+        # Scale down the projections for better stability
+        q_classical = q_classical * 0.05  # Further reduced scaling
+        k_classical = k_classical * 0.05
+        v_classical = v_classical * 0.05
 
-        attention_scores_or_weights_tensor = torch.zeros(batch_size, seq_len, seq_len, device=x_embed.device)
+        attention_scores = torch.zeros(batch_size, seq_len, seq_len, device=x_embed.device)
 
         for b_idx in range(batch_size):
-            q_seq_single = q_classical[b_idx] 
-            k_seq_single = k_classical[b_idx] 
+            q_seq_single = q_classical[b_idx]
+            k_seq_single = k_classical[b_idx]
             
             for i in range(seq_len):
                 q_i_features_raw = q_seq_single[i]
                 q_i_features = self._prepare_features_for_amplitude_encoding(q_i_features_raw)
-                current_q_raw_scores = torch.zeros(seq_len, device=x_embed.device)
+                current_q_raw_scores_for_aa = torch.zeros(seq_len, device=x_embed.device)
+
                 for j in range(seq_len):
                     k_j_features_raw = k_seq_single[j]
                     k_j_features = self._prepare_features_for_amplitude_encoding(k_j_features_raw)
@@ -320,61 +446,62 @@ class QuantumSelfAttentionLayer(nn.Module):
                         probs_ancilla = hadamard_test_re_inner_product_circuit(q_i_features, k_j_features)
                     except Exception as e:
                         logger.error(f"ERROR in QNode hadamard_test_re_inner_product_circuit at b{b_idx},i{i},j{j}: {e}")
-                        logger.error(f"  Q_features (input to QNode): {q_i_features.detach().cpu().numpy()}")
-                        logger.error(f"  K_features (input to QNode): {k_j_features.detach().cpu().numpy()}")
-                        probs_ancilla = torch.tensor([0.5, 0.5], device=x_embed.device, dtype=q_i_features.dtype) 
+                        probs_ancilla = torch.tensor([0.5, 0.5], device=x_embed.device, dtype=q_i_features.dtype)
 
                     z_ij = probs_ancilla[0] - probs_ancilla[1]
-                    if not torch.isfinite(z_ij).all(): 
-                        # logger.warning(f"NaN/inf detected in z_ij at b_idx={b_idx}, i={i}, j={j}. Q_feat: {q_i_features.detach().cpu().numpy()}, K_feat: {k_j_features.detach().cpu().numpy()}, Probs: {probs_ancilla.detach().cpu().numpy()}")
-                        z_ij = torch.tensor(0.0, device=z_ij.device, dtype=q_i_features.dtype) 
-                    current_q_raw_scores[j] = z_ij
-                
+                    if not torch.isfinite(z_ij).all():
+                        z_ij = torch.tensor(0.0, device=z_ij.device, dtype=q_i_features.dtype)
+                    
+                    # Scale down the attention scores
+                    attention_scores[b_idx, i, j] = z_ij * 0.05  # Further reduced scaling
+                    if self.use_quantum_softmax:
+                        current_q_raw_scores_for_aa[j] = z_ij * 0.05
+
                 if self.use_quantum_softmax:
-                    initial_probs_for_aa = self._relu_normalize_l1(current_q_raw_scores) 
+                    initial_probs_for_aa = self._relu_normalize_l1(current_q_raw_scores_for_aa)
                     if not torch.isfinite(initial_probs_for_aa).all():
-                        # logger.warning(f"NaN/inf in initial_probs_for_aa at b{b_idx},i{i}. Replacing with uniform.")
-                        initial_probs_for_aa = torch.ones_like(initial_probs_for_aa) / (initial_probs_for_aa.shape[0] + 1e-9) 
+                        initial_probs_for_aa = torch.ones_like(initial_probs_for_aa) / (initial_probs_for_aa.shape[0] + 1e-9)
 
                     try:
                         aa_output_probs_all_states = partial_amplitude_amplification_softmax(initial_probs_for_aa)
                     except Exception as e:
                         logger.error(f"ERROR in QNode partial_amplitude_amplification_softmax at b{b_idx},i{i}: {e}")
-                        logger.error(f"  Initial_probs_for_aa: {initial_probs_for_aa.detach().cpu().numpy()}")
                         aa_output_probs_all_states = torch.ones(2**N_QUBITS_AA_SOFTMAX, device=x_embed.device, dtype=initial_probs_for_aa.dtype) / (2**N_QUBITS_AA_SOFTMAX)
 
-                    aa_weights = aa_output_probs_all_states[:seq_len] 
+                    aa_weights = aa_output_probs_all_states[:seq_len]
                     final_weights_sum = torch.sum(aa_weights)
-                    if final_weights_sum.item() < 1e-9 : 
-                        final_weights = torch.ones_like(aa_weights) / (seq_len + 1e-9) 
+                    if final_weights_sum.item() < 1e-9:
+                        final_weights = torch.ones_like(aa_weights) / (seq_len + 1e-9)
                     else:
                         final_weights = aa_weights / (final_weights_sum + 1e-9)
 
                     if not torch.isfinite(final_weights).all():
-                        # logger.warning(f"NaN/inf in final_weights (AA) at b{b_idx},i{i}. Replacing with uniform.")
-                        final_weights = torch.ones_like(final_weights) / (seq_len + 1e-9) 
-                    attention_scores_or_weights_tensor[b_idx, i, :] = final_weights
-                else:
-                    attention_scores_or_weights_tensor[b_idx, i, :] = current_q_raw_scores
-        
+                        final_weights = torch.ones_like(final_weights) / (seq_len + 1e-9)
+                    attention_scores[b_idx, i, :] = final_weights
+
         if self.use_quantum_softmax:
-            attention_weights = attention_scores_or_weights_tensor 
+            attention_weights = attention_scores
         else:
-            if not torch.isfinite(attention_scores_or_weights_tensor).all():
-                # logger.warning("NaN/inf detected in attention_scores_or_weights_tensor before classical softmax. Replacing with zeros.")
-                attention_scores_or_weights_tensor = torch.where(torch.isfinite(attention_scores_or_weights_tensor), 
-                                                                 attention_scores_or_weights_tensor,
-                                                                 torch.zeros_like(attention_scores_or_weights_tensor))
-            attention_weights = nn.functional.softmax(attention_scores_or_weights_tensor / (self.sqrt_d_k + 1e-9), dim=-1) 
-        
+            if not torch.isfinite(attention_scores).all():
+                attention_scores = torch.where(torch.isfinite(attention_scores),
+                                             attention_scores,
+                                             torch.zeros_like(attention_scores))
+            # Scale down the attention scores before softmax
+            attention_weights = nn.functional.softmax(attention_scores / (self.sqrt_d_k * 4 + 1e-9), dim=-1)  # Increased temperature
+
         if not torch.isfinite(attention_weights).all():
-            # logger.warning("NaN/inf detected in final attention_weights. Replacing with uniform.")
-            attention_weights = torch.ones_like(attention_weights) / (attention_weights.shape[-1] + 1e-9) 
+            attention_weights = torch.ones_like(attention_weights) / (attention_weights.shape[-1] + 1e-9)
+
+        # Scale down attention weights
+        attention_weights = attention_weights * 0.1
 
         context_vectors = torch.bmm(attention_weights, v_classical)
         if not torch.isfinite(context_vectors).all():
             logger.error("NaN/inf detected in context_vectors. Propagating NaN.")
             return torch.full_like(v_classical, float('nan')), attention_weights
+
+        # Scale down the context vectors
+        context_vectors = context_vectors * 0.05  # Further reduced scaling
 
         return context_vectors, attention_weights
 
@@ -382,77 +509,84 @@ class QSATextClassifier(nn.Module):
     def __init__(self, vocab_size_param, embed_dim_param, num_classes_param, n_shots_qip_param, 
                  use_quantum_softmax_param=False, aa_iterations_param=1, pad_idx_param=0): 
         super().__init__()
-        # Initialize embedding layer with even smaller weights and add layer norm
+        # Initialize embedding with very small values
         self.embedding_layer = nn.Embedding(vocab_size_param, embed_dim_param, padding_idx=pad_idx_param)
         nn.init.normal_(self.embedding_layer.weight, mean=0.0, std=0.005)  # Further reduced std
-        self.embed_dropout = nn.Dropout(0.1)
-        self.layer_norm = nn.LayerNorm(embed_dim_param)  # Add layer normalization
-        
         with torch.no_grad(): 
             if pad_idx_param < self.embedding_layer.weight.size(0): 
                  self.embedding_layer.weight[pad_idx_param].zero_()
-
+        
+        # Add layer normalization after embedding
+        self.embed_norm = nn.LayerNorm(embed_dim_param, eps=1e-6)
+        
         self.qsa_layer = QuantumSelfAttentionLayer(embed_dim_param, n_shots_qip_param, 
                                                    use_quantum_softmax_param, aa_iterations_param)
+        
+        # Add dropout for regularization
+        self.dropout = nn.Dropout(0.1)
+        
         self.fc_out = nn.Linear(embed_dim_param, num_classes_param)
         self._init_fc_weights() 
 
     def _init_fc_weights(self): 
-        nn.init.xavier_uniform_(self.fc_out.weight, gain=0.1)  # Further reduced gain
+        nn.init.xavier_uniform_(self.fc_out.weight, gain=0.05)  # Further reduced gain
         if self.fc_out.bias is not None:
             nn.init.zeros_(self.fc_out.bias)
 
     def forward(self, text_batch_ids): 
-        # Add input validation
-        if not torch.isfinite(text_batch_ids).all():
-            logger.error("Non-finite values in input text_batch_ids")
-            return torch.full((text_batch_ids.shape[0], self.fc_out.out_features), float('nan'), device=text_batch_ids.device), \
-                   torch.full((text_batch_ids.shape[0], MAX_LEN, MAX_LEN), float('nan'), device=text_batch_ids.device)
-
-        # Get embeddings with gradient clipping and layer norm
+        # Get embeddings and apply layer normalization
         embedded_text = self.embedding_layer(text_batch_ids)
-        embedded_text = self.layer_norm(embedded_text)  # Apply layer normalization
-        embedded_text = self.embed_dropout(embedded_text)
         
-        # Clip embedding values to prevent extreme values
-        embedded_text = torch.clamp(embedded_text, min=-3.0, max=3.0)  # Tighter bounds
+        # Scale down embeddings immediately
+        embedded_text = embedded_text * 0.1
+        
+        # Apply layer normalization
+        embedded_text = self.embed_norm(embedded_text)
         
         if not torch.isfinite(embedded_text).all():
-            logger.error(f"NaN/inf detected in embedded_text after embedding layer and clipping. Input IDs sample: {text_batch_ids[0, :5] if text_batch_ids.shape[0] > 0 else 'empty_batch'}")
-            # Instead of propagating NaN, use small random values for problematic rows
+            logger.error(f"NaN/inf detected in embedded_text after embedding layer. Input IDs sample: {text_batch_ids[0, :5] if text_batch_ids.shape[0] > 0 else 'empty_batch'}. Replacing with random.")
             mask = ~torch.isfinite(embedded_text)
-            random_values = torch.randn_like(embedded_text) * 0.01
-            embedded_text = torch.where(mask, random_values, embedded_text)
+            random_replacement = torch.randn_like(embedded_text) * 0.001  # Even smaller random values
+            embedded_text = torch.where(mask, random_replacement, embedded_text)
+            if not torch.isfinite(embedded_text).all(): 
+                logger.critical("Persistent NaN/inf even after attempting to replace in embedded_text. Propagating NaN.")
+                nan_logits = torch.full((text_batch_ids.shape[0], self.fc_out.out_features), float('nan'), device=text_batch_ids.device)
+                nan_attn = torch.full((text_batch_ids.shape[0], MAX_LEN, MAX_LEN), float('nan'), device=text_batch_ids.device)
+                return nan_logits, nan_attn
         
-        # Normalize embeddings with more robust handling
-        norm_embedded = torch.linalg.norm(embedded_text, ord=2, dim=-1, keepdim=True)
-        norm_embedded = torch.clamp(norm_embedded, min=1e-6)  # Prevent division by very small numbers
-        embedded_text_normalized = embedded_text / norm_embedded
+        # Apply dropout for regularization
+        embedded_text = self.dropout(embedded_text)
         
-        # Final check after normalization
+        # Normalize embeddings with more robust normalization
+        norm = torch.linalg.norm(embedded_text, ord=2, dim=-1, keepdim=True)
+        norm = torch.clamp(norm, min=1e-6)  # Prevent division by very small numbers
+        embedded_text_normalized = embedded_text / norm
+        
         if not torch.isfinite(embedded_text_normalized).all():
-            logger.error("Persistent NaN/inf in embedded_text_normalized after robust normalization")
-            # Use small random values for problematic rows
-            mask = ~torch.isfinite(embedded_text_normalized)
-            random_values = torch.randn_like(embedded_text_normalized) * 0.01
-            embedded_text_normalized = torch.where(mask, random_values, embedded_text_normalized)
+            logger.error("Persistent NaN/inf in embedded_text_normalized after robust normalization. Propagating NaN.")
+            nan_logits = torch.full((text_batch_ids.shape[0], self.fc_out.out_features), float('nan'), device=text_batch_ids.device)
+            nan_attn = torch.full((text_batch_ids.shape[0], MAX_LEN, MAX_LEN), float('nan'), device=text_batch_ids.device)
+            return nan_logits, nan_attn
 
         context_vectors, attn_weights = self.qsa_layer(embedded_text_normalized)
         
         if not torch.isfinite(context_vectors).all():
-            logger.error("NaN/inf detected in context_vectors from QSA layer")
-            # Use small random values for problematic rows
-            mask = ~torch.isfinite(context_vectors)
-            random_values = torch.randn_like(context_vectors) * 0.01
-            context_vectors = torch.where(mask, random_values, context_vectors)
+            logger.error("NaN/inf detected in context_vectors from QSA layer. Propagating NaN.")
+            nan_logits = torch.full((text_batch_ids.shape[0], self.fc_out.out_features), float('nan'), device=text_batch_ids.device)
+            return nan_logits, attn_weights 
 
-        # Mean pooling with robust handling
+        # Apply dropout to context vectors
+        context_vectors = self.dropout(context_vectors)
+        
+        # Use mean pooling with more stable implementation
         pooled_context = torch.mean(context_vectors, dim=1)
-        pooled_context = torch.clamp(pooled_context, min=-3.0, max=3.0)  # Tighter bounds
+        pooled_context = torch.clamp(pooled_context, min=-1.0, max=1.0)  # Tighter clamping
 
-        # Final classification with gradient clipping
+        # Scale down before final layer
+        pooled_context = pooled_context * 0.1
+        
         output_logits = self.fc_out(pooled_context)
-        output_logits = torch.clamp(output_logits, min=-5.0, max=5.0)  # Tighter bounds
+        output_logits = torch.clamp(output_logits, min=-1.0, max=1.0)  # Tighter clamping
 
         return output_logits, attn_weights
 
@@ -464,6 +598,7 @@ def train_and_evaluate_model(model_config_name, use_quantum_softmax_flag, train_
     logger.info(f"Model Configuration:")
     logger.info(f"  - Model Name: {model_config_name}")
     logger.info(f"  - Quantum Softmax: {use_quantum_softmax_flag}")
+    # ... (other logging as before)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -472,15 +607,13 @@ def train_and_evaluate_model(model_config_name, use_quantum_softmax_flag, train_
                               use_quantum_softmax_param=use_quantum_softmax_flag, 
                               aa_iterations_param=AA_ITERATIONS, 
                               pad_idx_param=current_pad_idx).to(device)
-    
-    # Use an even more conservative learning rate and stronger weight decay
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * 0.1, weight_decay=0.05)
-    
-    # Add learning rate scheduler with more conservative settings
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=3)
-    
     criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01) # AdamW with weight decay
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=2) # LR Scheduler
+
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.")
+
+    # torch.autograd.set_detect_anomaly(True) # UNCOMMENT THIS FOR DETAILED NaN GRADIENT TRACEBACK
 
     history = {'train_loss': [], 'val_loss': [], 'val_accuracy': [], 
                'val_precision': [], 'val_recall': [], 'val_f1': [],
@@ -509,17 +642,22 @@ def train_and_evaluate_model(model_config_name, use_quantum_softmax_flag, train_
             texts, labels = texts.to(device), labels.to(device)
             optimizer.zero_grad()
             
+            # torch.autograd.set_detect_anomaly(True) # Enable here for per-batch debugging
             predictions, _ = model(texts) 
+            # torch.autograd.set_detect_anomaly(False) # Disable after forward pass
             
-            if not torch.isfinite(predictions).all():
+            if not torch.isfinite(predictions).all(): 
                 logger.error(f"NaN/inf detected in predictions at Epoch {epoch+1}, Batch {i+1}. Stopping epoch.")
+                # logger.error(f"Problematic 'texts' input: {texts.cpu().numpy()}")
+                # logger.error(f"Problematic 'predictions': {predictions.cpu().detach().numpy()}")
                 nan_detected_in_current_epoch = True; nan_detected_overall = True
                 break 
 
             loss = criterion(predictions, labels)
             
-            if not torch.isfinite(loss).all():
+            if not torch.isfinite(loss).all(): 
                 logger.error(f"NaN/inf detected in loss at Epoch {epoch+1}, Batch {i+1}. Stopping epoch.")
+                # logger.error(f"Problematic 'predictions' that led to NaN loss: {predictions.cpu().detach().numpy()}")
                 nan_detected_in_current_epoch = True; nan_detected_overall = True
                 break 
 
@@ -545,9 +683,6 @@ def train_and_evaluate_model(model_config_name, use_quantum_softmax_flag, train_
         history['train_loss'].append(avg_epoch_train_loss)
         history['epoch_train_time'].append(epoch_train_time)
         logger.info(f"  End of Epoch {epoch+1} - Avg Training Loss: {avg_epoch_train_loss:.4f} - Train Time: {epoch_train_time:.2f}s")
-
-        # Update learning rate based on validation loss
-        scheduler.step(avg_epoch_train_loss)
 
         eval_start_time = time.time()
         model.eval()
@@ -590,10 +725,12 @@ def train_and_evaluate_model(model_config_name, use_quantum_softmax_flag, train_
         history['epoch_eval_time'].append(epoch_eval_time)
 
         logger.info(f"  Test Results Epoch {epoch+1}: Avg Val Loss: {avg_epoch_val_loss:.4f}, Acc: {accuracy:.2f}%, F1: {f1:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f} - Eval Time: {epoch_eval_time:.2f}s")
+        scheduler.step(avg_epoch_val_loss if not math.isnan(avg_epoch_val_loss) else float('inf')) # Step scheduler
     
     total_training_end_time = time.time()
     total_time = total_training_end_time - total_training_start_time
     logger.info(f"--- Finished: {model_config_name} --- Total Training & Eval Time: {total_time:.2f}s ---")
+    # torch.autograd.set_detect_anomaly(False) # Remember to disable if enabled per batch
     return history, total_time
 
 # --- Plotting and Analysis Functions ---
@@ -661,7 +798,7 @@ def plot_metrics(history, model_name):
     logger.info(f"Metrics plot saved to metrics_{model_name.replace(' ', '_')}.png")
 
 def visualize_attention(text_ids_sample, attention_weights, model_name, current_vocab, sample_idx=0):
-    if attention_weights is None or len(attention_weights) == 0 or torch.isnan(attention_weights).any() or torch.isinf(attention_weights).any():
+    if attention_weights is None or len(attention_weights) == 0 or not torch.isfinite(attention_weights).all():
         logger.warning(f"Cannot visualize attention for {model_name} due to invalid attention_weights.")
         return
     
