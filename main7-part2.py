@@ -201,3 +201,6 @@ sample_inputs, _ = next(iter(test_loader))
 tokens = [list(vocab.keys())[list(vocab.values()).index(i)] if i in vocab.values() else "<unk>" for i in sample_inputs[0].tolist()]
 _, attn_weights = model(sample_inputs)
 visualize_attention(tokens, attn_weights[0].detach().cpu().numpy())
+
+total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Modelul are {total:,} parametri trainabili.")
